@@ -8,6 +8,9 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Literal
 
+from chgnet.model.pso_optimizer import PSOOptimizer#
+import random#
+from scipy.constants import R as GAS_CONSTANT#
 import numpy as np
 from ase import Atoms, units
 from ase.calculators.calculator import (
@@ -52,6 +55,7 @@ OPTIMIZERS = {
     "SciPyFminCG": SciPyFminCG,
     "SciPyFminBFGS": SciPyFminBFGS,
     "BFGSLineSearch": BFGSLineSearch,
+    "PSO": PSOOptimizer
 }
 
 
@@ -69,6 +73,7 @@ class CHGNetCalculator(Calculator):
         stress_weight: float = units.GPa,  # GPa to eV/A^3
         on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
         return_site_energies: bool = False,
+        entropy_weight: float = 0.1,  # 添加熵权重参数
         **kwargs,
     ) -> None:
         """Provide a CHGNet instance to calculate various atomic properties using ASE.
@@ -105,6 +110,7 @@ class CHGNetCalculator(Calculator):
         self.model.graph_converter.set_isolated_atom_response(on_isolated_atoms)
         self.stress_weight = stress_weight
         self.return_site_energies = return_site_energies
+        self.entropy_weight = entropy_weight  # 保存熵权重参数
         print(f"CHGNet will run on {self.device}")
 
     @classmethod
@@ -170,15 +176,65 @@ class CHGNetCalculator(Calculator):
             m=("magmoms", 1),
             s=("stress", self.stress_weight),
         )
+
         self.results |= {
             long_key: model_prediction[key] * factor
             for key, (long_key, factor) in key_map.items()
             if key in model_prediction
         }
+
+        # 如果启用了熵计算，则修改能量
+        if self.entropy_weight > 0:
+            # 计算构型熵
+            entropy = self.calculate_configurational_entropy(atoms)
+
+            # 保存原始能量
+            original_energy = self.results["energy"]
+
+            # 计算修改后的能量：E_min - entropy_weight * S_conf
+            modified_energy = original_energy - self.entropy_weight * entropy
+
+            # 更新结果
+            self.results["original_energy"] = original_energy
+            self.results["configurational_entropy"] = entropy
+            self.results["entropy_weight"] = self.entropy_weight
+            self.results["energy"] = modified_energy
+
         self.results["free_energy"] = self.results["energy"]
         self.results["crystal_fea"] = model_prediction["crystal_fea"]
         if self.return_site_energies:
             self.results["energies"] = model_prediction["site_energies"]
+
+    ## 计算构型熵
+    def calculate_configurational_entropy(self, atoms: Atoms) -> float:
+        """
+        计算原子结构的构型熵。
+
+        Args:
+            atoms: ASE Atoms对象
+
+        Returns:
+            float: 构型熵，单位为eV/K
+        """
+        # 获取原子序数并计算元素频率
+        atomic_numbers = atoms.get_atomic_numbers()
+        unique_elements, counts = np.unique(atomic_numbers, return_counts=True)
+
+        # 计算原子分数
+        total_atoms = len(atomic_numbers)
+        atomic_fractions = counts / total_atoms
+
+        # 使用玻尔兹曼熵公式计算: S_conf = -R * sum(c_i * ln(c_i))
+        # 将R从J/(mol·K)转换为eV/K以与CHGNet能量单位保持一致
+        R_eV = GAS_CONSTANT / 96485.3  # 转换为eV/K
+
+        entropy = 0
+        for fraction in atomic_fractions:
+            if fraction > 0:  # 避免ln(0)
+                entropy -= fraction * np.log(fraction)
+
+        entropy *= R_eV
+        return entropy
 
 
 class StructOptimizer:
@@ -241,19 +297,28 @@ class StructOptimizer:
         return self.calculator.model.n_params
 
     def relax(
-        self,
-        atoms: Structure | Atoms,
-        *,
-        fmax: float | None = 0.1,
-        steps: int | None = 500,
-        relax_cell: bool | None = True,
-        ase_filter: str | None = "FrechetCellFilter",
-        save_path: str | None = None,
-        loginterval: int | None = 1,
-        crystal_feas_save_path: str | None = None,
-        verbose: bool = True,
-        assign_magmoms: bool = True,
-        **kwargs,
+            self,
+            atoms: Structure | Atoms,
+            *,
+            fmax: float | None = 0.1,
+            steps: int | None = 500,
+            relax_cell: bool | None = True,
+            ase_filter: str | None = "FrechetCellFilter",
+            save_path: str | None = None,
+            loginterval: int | None = 1,
+            crystal_feas_save_path: str | None = None,
+            verbose: bool = True,
+            assign_magmoms: bool = True,
+            # 添加新参数
+            swap_atoms: bool = False,
+            swap_probability: float = 0.2,
+            different_elements_only: bool = False,
+            perturb_structure: bool = False,
+            perturbation_amplitude: float = 0.1,
+            distort_lattice: bool = False,
+            strain_range: float = 0.05,
+            symmetric_strain: bool = True,
+            **kwargs,
     ) -> dict[str, Structure | TrajectoryObserver]:
         """Relax the Structure/Atoms until maximum force is smaller than fmax.
 
@@ -267,9 +332,6 @@ class StructOptimizer:
                 Default = True
             ase_filter (str | ase.filters.Filter): The filter to apply to the atoms
                 object for relaxation. Default = FrechetCellFilter
-                Default used to be ExpCellFilter which was removed due to bug reported
-                in https://gitlab.com/ase/ase/-/issues/1321 and fixed in
-                https://gitlab.com/ase/ase/-/merge_requests/3024.
             save_path (str | None): The path to save the trajectory.
                 Default = None
             loginterval (int | None): Interval for logging trajectory and crystal
@@ -281,6 +343,22 @@ class StructOptimizer:
                 Default = True
             assign_magmoms (bool): Whether to assign magnetic moments to the final
                 structure. Default = True
+            swap_atoms (bool): Whether to swap atom positions before optimization.
+                Default = False
+            swap_probability (float): Probability of atom swapping.
+                Default = 0.2
+            different_elements_only (bool): Whether to only swap atoms of different elements.
+                Default = False
+            perturb_structure (bool): Whether to add random perturbations to atom positions.
+                Default = False
+            perturbation_amplitude (float): Maximum amplitude of perturbations in Angstroms.
+                Default = 0.1
+            distort_lattice (bool): Whether to apply random strain to the lattice.
+                Default = False
+            strain_range (float): Maximum strain to apply to the lattice.
+                Default = 0.05
+            symmetric_strain (bool): Whether to apply symmetric (isotropic) strain.
+                Default = True
             **kwargs: Additional parameters for the optimizer.
 
         Returns:
@@ -305,8 +383,68 @@ class StructOptimizer:
                 )
 
         if isinstance(atoms, Structure):
-            atoms = AseAtomsAdaptor().get_atoms(atoms)
+            # 结构预处理: 在转换为ASE原子前应用变换
+            # 先应用晶格畸变，再交换原子，最后添加扰动
+            structure = atoms.copy()
 
+            # 应用晶格畸变
+            if distort_lattice:
+                structure = self._distort_lattice(
+                    structure,
+                    strain_range=strain_range,
+                    symmetric=symmetric_strain
+                )
+                if verbose:
+                    print(f"Applied lattice distortion with strain range {strain_range}")
+
+            # 交换原子位置
+            if swap_atoms:
+                structure = self._swap_atoms(
+                    structure,
+                    swap_probability=swap_probability,
+                    different_elements_only=different_elements_only
+                )
+                if verbose:
+                    print(f"Swapped atoms with probability {swap_probability}")
+
+            # 添加原子位置扰动
+            if perturb_structure:
+                structure = self._perturb_structure(
+                    structure,
+                    amplitude=perturbation_amplitude
+                )
+                if verbose:
+                    print(f"Applied perturbations with amplitude {perturbation_amplitude} Å")
+
+            atoms = AseAtomsAdaptor().get_atoms(structure)
+        elif perturb_structure or swap_atoms or distort_lattice:
+            # 如果输入是Atoms对象但请求了结构修改，需要先转换
+            structure = AseAtomsAdaptor.get_structure(atoms)
+
+            # 应用相同的变换
+            if distort_lattice:
+                structure = self._distort_lattice(
+                    structure,
+                    strain_range=strain_range,
+                    symmetric=symmetric_strain
+                )
+
+            if swap_atoms:
+                structure = self._swap_atoms(
+                    structure,
+                    swap_probability=swap_probability,
+                    different_elements_only=different_elements_only
+                )
+
+            if perturb_structure:
+                structure = self._perturb_structure(
+                    structure,
+                    amplitude=perturbation_amplitude
+                )
+
+            atoms = AseAtomsAdaptor().get_atoms(structure)
+
+        # 以下是原有代码
         atoms.calc = self.calculator  # assign model used to predict forces
 
         stream = sys.stdout if verbose else io.StringIO()
@@ -344,6 +482,122 @@ class StructOptimizer:
                 "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
             )
         return {"final_structure": struct, "trajectory": obs}
+
+    def _swap_atoms(self, structure, swap_probability=0.2, different_elements_only=False):
+        """
+        交换结构中原子的位置。
+
+        Args:
+            structure: 要修改的结构
+            swap_probability: 尝试交换的概率
+            different_elements_only: 是否只交换不同元素的原子
+
+        Returns:
+            修改后的结构
+        """
+        # 创建结构副本
+        structure = structure.copy()
+        n_sites = len(structure)
+
+        # 如果结构太小，不执行交换
+        if n_sites < 2:
+            return structure
+
+        # 确定要交换的原子对数量
+        n_swaps = max(1, int(n_sites * swap_probability / 2))
+
+        for _ in range(n_swaps):
+            # 随机选择两个不同的原子索引
+            i, j = random.sample(range(n_sites), 2)
+
+            # 如果要求只交换不同元素的原子
+            if different_elements_only:
+                # 尝试最多10次找到不同元素的原子对
+                attempts = 0
+                while structure[i].species == structure[j].species and attempts < 10:
+                    i, j = random.sample(range(n_sites), 2)
+                    attempts += 1
+
+                # 如果找不到不同元素的原子对，跳过这次交换
+                if structure[i].species == structure[j].species:
+                    continue
+
+            # 交换原子位置
+            site_i = structure[i]
+            site_j = structure[j]
+
+            # 保存属性
+            props_i = {k: v[i] for k, v in structure.site_properties.items()}
+            props_j = {k: v[j] for k, v in structure.site_properties.items()}
+
+            # 执行交换
+            structure.replace(i, site_j.species, coords=site_i.coords, properties=props_i)
+            structure.replace(j, site_i.species, coords=site_j.coords, properties=props_j)
+
+        return structure
+
+    def _perturb_structure(self, structure, amplitude=0.1):
+        """
+        给结构添加随机扰动。
+
+        Args:
+            structure: 要扰动的结构
+            amplitude: 扰动的最大幅度(Å)
+
+        Returns:
+            扰动后的结构
+        """
+        # 创建结构副本
+        structure = structure.copy()
+        coords = structure.cart_coords
+
+        # 生成随机扰动
+        perturbation = (np.random.random(coords.shape) - 0.5) * 2 * amplitude
+
+        # 应用扰动
+        structure.cart_coords = coords + perturbation
+
+        return structure
+
+    def _distort_lattice(self, structure, strain_range=0.05, symmetric=True):
+        """
+        对晶格应用随机畸变。
+
+        Args:
+            structure: 要畸变的结构
+            strain_range: 应变的最大范围
+            symmetric: 是否应用对称应变
+
+        Returns:
+            畸变后的结构
+        """
+        # 创建结构副本
+        structure = structure.copy()
+
+        if symmetric:
+            # 对称应变 (各向同性)
+            strain = np.random.uniform(-strain_range, strain_range)
+            strain_matrix = np.eye(3) * strain
+        else:
+            # 非对称应变 (各向异性)
+            strain_xx = np.random.uniform(-strain_range, strain_range)
+            strain_yy = np.random.uniform(-strain_range, strain_range)
+            strain_zz = np.random.uniform(-strain_range, strain_range)
+            strain_xy = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
+            strain_xz = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
+            strain_yz = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
+
+            # 创建应变矩阵 (3x3)
+            strain_matrix = np.array([
+                [strain_xx, strain_xy, strain_xz],
+                [strain_xy, strain_yy, strain_yz],
+                [strain_xz, strain_yz, strain_zz]
+            ])
+
+        # 应用应变
+        structure.apply_strain(strain_matrix)
+
+        return structure
 
 
 class TrajectoryObserver:
@@ -916,3 +1170,4 @@ class EquationOfState:
         if unit in {"Pa^-1", "m^2/N"}:
             return 1 / (self.bm.b0_GPa * 1e9)
         raise NotImplementedError("unit has to be one of A^3/eV, GPa^-1 Pa^-1 or m^2/N")
+
