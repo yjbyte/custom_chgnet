@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import io
 import pickle
 import sys
 import warnings
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, List, Tuple, Union, Dict, Any
 
-from chgnet.model.pso_optimizer import PSOOptimizer#
+from tqdm import tqdm
+
+from chgnet.model.pso_optimizer import PSO
 import random#
 from scipy.constants import R as GAS_CONSTANT#
 import numpy as np
@@ -55,7 +58,7 @@ OPTIMIZERS = {
     "SciPyFminCG": SciPyFminCG,
     "SciPyFminBFGS": SciPyFminBFGS,
     "BFGSLineSearch": BFGSLineSearch,
-    "PSO": PSOOptimizer
+    "PSO": PSO,  # 添加PSO优化器
 }
 
 
@@ -318,6 +321,9 @@ class StructOptimizer:
             distort_lattice: bool = False,
             strain_range: float = 0.05,
             symmetric_strain: bool = True,
+            # 添加PSO相关参数
+            use_pso: bool = False,
+            n_particles: int = 10,
             **kwargs,
     ) -> dict[str, Structure | TrajectoryObserver]:
         """Relax the Structure/Atoms until maximum force is smaller than fmax.
@@ -453,35 +459,51 @@ class StructOptimizer:
 
             if crystal_feas_save_path:
                 cry_obs = CrystalFeasObserver(atoms)
+#todo
+                # 选择优化器
+                if use_pso or (hasattr(self, 'optimizer_class') and
+                               (self.optimizer_class == PSO or
+                                (isinstance(self.optimizer_class, str) and
+                                 self.optimizer_class.upper() == "PSO"))):
+                    # 使用PSO优化器
+                    optimizer = PSO(
+                        atoms,
+                        logfile=stream if verbose else None,
+                        n_particles=n_particles,
+                        swap_probability=swap_probability,
+                        fix_cell=not relax_cell,
+                        max_iterations=steps,
+                        **kwargs
+                    )
+                else:
+                    # 使用常规优化器
+                    optimizer = self.optimizer_class(atoms, **kwargs)
 
-            if relax_cell:
-                atoms = ase_filter(atoms)
-            optimizer: Optimizer = self.optimizer_class(atoms, **kwargs)
-            optimizer.attach(obs, interval=loginterval)
+                optimizer.attach(obs, interval=loginterval)
+
+                if crystal_feas_save_path:
+                    optimizer.attach(cry_obs, interval=loginterval)
+
+                optimizer.run(fmax=fmax, steps=steps)
+                obs()
+
+            if save_path is not None:
+                obs.save(save_path)
 
             if crystal_feas_save_path:
-                optimizer.attach(cry_obs, interval=loginterval)
+                cry_obs.save(crystal_feas_save_path)
 
-            optimizer.run(fmax=fmax, steps=steps)
-            obs()
+            if isinstance(atoms, Filter):
+                atoms = atoms.atoms
+            struct = AseAtomsAdaptor.get_structure(atoms)
 
-        if save_path is not None:
-            obs.save(save_path)
-
-        if crystal_feas_save_path:
-            cry_obs.save(crystal_feas_save_path)
-
-        if isinstance(atoms, Filter):
-            atoms = atoms.atoms
-        struct = AseAtomsAdaptor.get_structure(atoms)
-
-        if assign_magmoms:
-            for key in struct.site_properties:
-                struct.remove_site_property(property_name=key)
-            struct.add_site_property(
-                "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
-            )
-        return {"final_structure": struct, "trajectory": obs}
+            if assign_magmoms:
+                for key in struct.site_properties:
+                    struct.remove_site_property(property_name=key)
+                struct.add_site_property(
+                    "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
+                )
+            return {"final_structure": struct, "trajectory": obs}
 
     def _swap_atoms(self, structure, swap_probability=0.2, different_elements_only=False):
         """
@@ -1170,4 +1192,8 @@ class EquationOfState:
         if unit in {"Pa^-1", "m^2/N"}:
             return 1 / (self.bm.b0_GPa * 1e9)
         raise NotImplementedError("unit has to be one of A^3/eV, GPa^-1 Pa^-1 or m^2/N")
+
+
+
+
 
