@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import contextlib
-import copy
 import inspect
 import io
 import pickle
 import sys
 import warnings
-from typing import TYPE_CHECKING, Literal, List, Tuple, Union, Dict, Any
+from typing import TYPE_CHECKING, Literal
 
-from tqdm import tqdm
 
 from chgnet.model.pso_optimizer import PSO
-import random#
-from scipy.constants import R as GAS_CONSTANT#
+from scipy.constants import R as GAS_CONSTANT
 import numpy as np
 from ase import Atoms, units
 from ase.calculators.calculator import (
@@ -76,7 +73,7 @@ class CHGNetCalculator(Calculator):
         stress_weight: float = units.GPa,  # GPa to eV/A^3
         on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
         return_site_energies: bool = False,
-        entropy_weight: float = 0.1,  # 添加熵权重参数
+        entropy_weight: float = 0.0,  # 添加熵权重参数
         **kwargs,
     ) -> None:
         """Provide a CHGNet instance to calculate various atomic properties using ASE.
@@ -135,6 +132,32 @@ class CHGNetCalculator(Calculator):
         """The number of parameters in CHGNet."""
         return self.model.n_params
 
+
+    ## 计算构型熵
+    def calculate_configurational_entropy(self, atoms: Atoms) -> float:
+        """
+        计算原子结构的构型熵。
+        Args:
+            atoms: ASE Atoms对象
+        Returns:
+            float: 构型熵，单位为eV/K
+        """
+        # 获取原子序数并计算元素频率
+        atomic_numbers = atoms.get_atomic_numbers()
+        unique_elements, counts = np.unique(atomic_numbers, return_counts=True)
+        # 计算原子分数
+        total_atoms = len(atomic_numbers)
+        atomic_fractions = counts / total_atoms
+        # 使用玻尔兹曼熵公式计算: S_conf = -R * sum(c_i * ln(c_i))
+        # 将R从J/(mol·K)转换为eV/K以与CHGNet能量单位保持一致
+        R_eV = GAS_CONSTANT / 96485.3  # 转换为eV/K
+        entropy = 0
+        for fraction in atomic_fractions:
+            if fraction > 0:  # 避免ln(0)
+                entropy -= fraction * np.log(fraction)
+        entropy *= R_eV
+        return entropy
+
     def calculate(
         self,
         atoms: Atoms | None = None,
@@ -186,58 +209,24 @@ class CHGNetCalculator(Calculator):
             if key in model_prediction
         }
 
-        # 如果启用了熵计算，则修改能量
-        if self.entropy_weight > 0:
-            # 计算构型熵
-            entropy = self.calculate_configurational_entropy(atoms)
 
-            # 保存原始能量
-            original_energy = self.results["energy"]
-
-            # 计算修改后的能量：E_min - entropy_weight * S_conf
-            modified_energy = original_energy - self.entropy_weight * entropy
-
-            # 更新结果
-            self.results["original_energy"] = original_energy
-            self.results["configurational_entropy"] = entropy
-            self.results["entropy_weight"] = self.entropy_weight
-            self.results["energy"] = modified_energy
 
         self.results["free_energy"] = self.results["energy"]
         self.results["crystal_fea"] = model_prediction["crystal_fea"]
         if self.return_site_energies:
             self.results["energies"] = model_prediction["site_energies"]
 
-    ## 计算构型熵
-    def calculate_configurational_entropy(self, atoms: Atoms) -> float:
-        """
-        计算原子结构的构型熵。
+            # 添加熵的计算与贡献
+            if self.entropy_weight > 0:
+                configurational_entropy = self.calculate_configurational_entropy(atoms)
+                # 熵贡献（负号是因为熵增加通常对应能量降低）
+                entropy_contribution = -self.entropy_weight * configurational_entropy
 
-        Args:
-            atoms: ASE Atoms对象
+                # 将熵贡献加入到能量中
+                self.results["energy"] += entropy_contribution
+                self.results["free_energy"] = self.results["energy"]
 
-        Returns:
-            float: 构型熵，单位为eV/K
-        """
-        # 获取原子序数并计算元素频率
-        atomic_numbers = atoms.get_atomic_numbers()
-        unique_elements, counts = np.unique(atomic_numbers, return_counts=True)
 
-        # 计算原子分数
-        total_atoms = len(atomic_numbers)
-        atomic_fractions = counts / total_atoms
-
-        # 使用玻尔兹曼熵公式计算: S_conf = -R * sum(c_i * ln(c_i))
-        # 将R从J/(mol·K)转换为eV/K以与CHGNet能量单位保持一致
-        R_eV = GAS_CONSTANT / 96485.3  # 转换为eV/K
-
-        entropy = 0
-        for fraction in atomic_fractions:
-            if fraction > 0:  # 避免ln(0)
-                entropy -= fraction * np.log(fraction)
-
-        entropy *= R_eV
-        return entropy
 
 
 class StructOptimizer:
@@ -250,6 +239,7 @@ class StructOptimizer:
         use_device: str | None = None,
         stress_weight: float = units.GPa,
         on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
+        entropy_weight: float = 0.0,  # 添加熵权重参数
     ) -> None:
         """Provide a trained CHGNet model and an optimizer to relax crystal structures.
 
@@ -287,6 +277,7 @@ class StructOptimizer:
                 stress_weight=stress_weight,
                 use_device=use_device,
                 on_isolated_atoms=on_isolated_atoms,
+                entropy_weight=entropy_weight,  # 传递熵权重参数
             )
 
     @property
@@ -389,66 +380,7 @@ class StructOptimizer:
                 )
 
         if isinstance(atoms, Structure):
-            # 结构预处理: 在转换为ASE原子前应用变换
-            # 先应用晶格畸变，再交换原子，最后添加扰动
-            structure = atoms.copy()
-
-            # 应用晶格畸变
-            if distort_lattice:
-                structure = self._distort_lattice(
-                    structure,
-                    strain_range=strain_range,
-                    symmetric=symmetric_strain
-                )
-                if verbose:
-                    print(f"Applied lattice distortion with strain range {strain_range}")
-
-            # 交换原子位置
-            if swap_atoms:
-                structure = self._swap_atoms(
-                    structure,
-                    swap_probability=swap_probability,
-                    different_elements_only=different_elements_only
-                )
-                if verbose:
-                    print(f"Swapped atoms with probability {swap_probability}")
-
-            # 添加原子位置扰动
-            if perturb_structure:
-                structure = self._perturb_structure(
-                    structure,
-                    amplitude=perturbation_amplitude
-                )
-                if verbose:
-                    print(f"Applied perturbations with amplitude {perturbation_amplitude} Å")
-
-            atoms = AseAtomsAdaptor().get_atoms(structure)
-        elif perturb_structure or swap_atoms or distort_lattice:
-            # 如果输入是Atoms对象但请求了结构修改，需要先转换
-            structure = AseAtomsAdaptor.get_structure(atoms)
-
-            # 应用相同的变换
-            if distort_lattice:
-                structure = self._distort_lattice(
-                    structure,
-                    strain_range=strain_range,
-                    symmetric=symmetric_strain
-                )
-
-            if swap_atoms:
-                structure = self._swap_atoms(
-                    structure,
-                    swap_probability=swap_probability,
-                    different_elements_only=different_elements_only
-                )
-
-            if perturb_structure:
-                structure = self._perturb_structure(
-                    structure,
-                    amplitude=perturbation_amplitude
-                )
-
-            atoms = AseAtomsAdaptor().get_atoms(structure)
+            atoms = AseAtomsAdaptor().get_atoms(atoms)
 
         # 以下是原有代码
         atoms.calc = self.calculator  # assign model used to predict forces
@@ -460,32 +392,49 @@ class StructOptimizer:
             if crystal_feas_save_path:
                 cry_obs = CrystalFeasObserver(atoms)
 #todo
-                # 选择优化器
-                if use_pso or (hasattr(self, 'optimizer_class') and
-                               (self.optimizer_class == PSO or
-                                (isinstance(self.optimizer_class, str) and
-                                 self.optimizer_class.upper() == "PSO"))):
-                    # 使用PSO优化器
-                    optimizer = PSO(
-                        atoms,
-                        logfile=stream if verbose else None,
-                        n_particles=n_particles,
-                        swap_probability=swap_probability,
-                        fix_cell=not relax_cell,
-                        max_iterations=steps,
-                        **kwargs
-                    )
-                else:
-                    # 使用常规优化器
-                    optimizer = self.optimizer_class(atoms, **kwargs)
+            # 选择优化器
+            if use_pso or (hasattr(self, 'optimizer_class') and
+                           (self.optimizer_class == PSO or
+                            (isinstance(self.optimizer_class, str) and
+                             self.optimizer_class.upper() == "PSO"))):
+                # 使用PSO优化器
+                # 只传递PSO支持的参数
+                pso_kwargs = {
+                    'fix_cell': not relax_cell,
+                    'max_iterations': steps,
+                    'n_particles': n_particles,
+                    'swap_probability': swap_probability,
+                    'different_elements_only': different_elements_only,
+                }
 
-                optimizer.attach(obs, interval=loginterval)
+                # 从kwargs中提取可能传递给PSO的其他参数
+                supported_pso_params = ['inertia_start', 'inertia_end', 'cognitive', 'social',
+                                        'velocity_scale', 'position_scale', 'finalize_with_lbfgs']
 
-                if crystal_feas_save_path:
-                    optimizer.attach(cry_obs, interval=loginterval)
+                for key in supported_pso_params:
+                    if key in kwargs:
+                        pso_kwargs[key] = kwargs.pop(key)
 
-                optimizer.run(fmax=fmax, steps=steps)
-                obs()
+                # 过滤掉任何不支持的参数
+                additional_kwargs = {}
+                for key in ['trajectory', 'restart', 'master']:
+                    if key in kwargs:
+                        additional_kwargs[key] = kwargs.pop(key)
+
+                optimizer = PSO(
+                    atoms,
+                    logfile=stream if verbose else None,
+                    **pso_kwargs,
+                    **additional_kwargs
+                )
+            else:
+                # 使用常规优化器
+                optimizer = self.optimizer_class(atoms, **kwargs)
+            optimizer.attach(obs, interval=loginterval)
+            if crystal_feas_save_path:
+                optimizer.attach(cry_obs, interval=loginterval)
+            optimizer.run(fmax=fmax, steps=steps)
+            obs()
 
             if save_path is not None:
                 obs.save(save_path)
@@ -505,121 +454,6 @@ class StructOptimizer:
                 )
             return {"final_structure": struct, "trajectory": obs}
 
-    def _swap_atoms(self, structure, swap_probability=0.2, different_elements_only=False):
-        """
-        交换结构中原子的位置。
-
-        Args:
-            structure: 要修改的结构
-            swap_probability: 尝试交换的概率
-            different_elements_only: 是否只交换不同元素的原子
-
-        Returns:
-            修改后的结构
-        """
-        # 创建结构副本
-        structure = structure.copy()
-        n_sites = len(structure)
-
-        # 如果结构太小，不执行交换
-        if n_sites < 2:
-            return structure
-
-        # 确定要交换的原子对数量
-        n_swaps = max(1, int(n_sites * swap_probability / 2))
-
-        for _ in range(n_swaps):
-            # 随机选择两个不同的原子索引
-            i, j = random.sample(range(n_sites), 2)
-
-            # 如果要求只交换不同元素的原子
-            if different_elements_only:
-                # 尝试最多10次找到不同元素的原子对
-                attempts = 0
-                while structure[i].species == structure[j].species and attempts < 10:
-                    i, j = random.sample(range(n_sites), 2)
-                    attempts += 1
-
-                # 如果找不到不同元素的原子对，跳过这次交换
-                if structure[i].species == structure[j].species:
-                    continue
-
-            # 交换原子位置
-            site_i = structure[i]
-            site_j = structure[j]
-
-            # 保存属性
-            props_i = {k: v[i] for k, v in structure.site_properties.items()}
-            props_j = {k: v[j] for k, v in structure.site_properties.items()}
-
-            # 执行交换
-            structure.replace(i, site_j.species, coords=site_i.coords, properties=props_i)
-            structure.replace(j, site_i.species, coords=site_j.coords, properties=props_j)
-
-        return structure
-
-    def _perturb_structure(self, structure, amplitude=0.1):
-        """
-        给结构添加随机扰动。
-
-        Args:
-            structure: 要扰动的结构
-            amplitude: 扰动的最大幅度(Å)
-
-        Returns:
-            扰动后的结构
-        """
-        # 创建结构副本
-        structure = structure.copy()
-        coords = structure.cart_coords
-
-        # 生成随机扰动
-        perturbation = (np.random.random(coords.shape) - 0.5) * 2 * amplitude
-
-        # 应用扰动
-        structure.cart_coords = coords + perturbation
-
-        return structure
-
-    def _distort_lattice(self, structure, strain_range=0.05, symmetric=True):
-        """
-        对晶格应用随机畸变。
-
-        Args:
-            structure: 要畸变的结构
-            strain_range: 应变的最大范围
-            symmetric: 是否应用对称应变
-
-        Returns:
-            畸变后的结构
-        """
-        # 创建结构副本
-        structure = structure.copy()
-
-        if symmetric:
-            # 对称应变 (各向同性)
-            strain = np.random.uniform(-strain_range, strain_range)
-            strain_matrix = np.eye(3) * strain
-        else:
-            # 非对称应变 (各向异性)
-            strain_xx = np.random.uniform(-strain_range, strain_range)
-            strain_yy = np.random.uniform(-strain_range, strain_range)
-            strain_zz = np.random.uniform(-strain_range, strain_range)
-            strain_xy = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
-            strain_xz = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
-            strain_yz = np.random.uniform(-strain_range / 2, strain_range / 2) if not symmetric else 0
-
-            # 创建应变矩阵 (3x3)
-            strain_matrix = np.array([
-                [strain_xx, strain_xy, strain_xz],
-                [strain_xy, strain_yy, strain_yz],
-                [strain_xz, strain_yz, strain_zz]
-            ])
-
-        # 应用应变
-        structure.apply_strain(strain_matrix)
-
-        return structure
 
 
 class TrajectoryObserver:

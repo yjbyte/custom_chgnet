@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import copy
 import random
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Optional
 
 import numpy as np
 from ase import Atoms
-from ase.calculators.calculator import Calculator
 from ase.optimize.optimize import Optimizer
 from ase.parallel import world
-from pymatgen.core import Structure
-from pymatgen.core.lattice import Lattice
-from pymatgen.io.ase import AseAtomsAdaptor
+
 
 
 class Particle:
@@ -146,10 +142,25 @@ class Particle:
                 self.cell_velocity *= 0.5
                 new_cell = current_cell + self.position_scale * self.cell_velocity
 
+        # 更新晶格后添加
+        if not fix_cell:
+            # 检查体积变化
+            old_vol = np.abs(np.linalg.det(current_cell))
+            new_vol = np.abs(np.linalg.det(new_cell))
+            # 如果体积变化过大，进行调整
+            if new_vol < 0.5 * old_vol or new_vol > 2.0 * old_vol:
+                scale = (old_vol / new_vol) ** (1 / 3)
+                new_cell *= scale
+                self.atoms.set_cell(new_cell, scale_atoms=True)
+
             # Apply new cell parameters
             self.atoms.set_cell(new_cell, scale_atoms=True)
 
-    def perturb_atom_order(self, swap_probability: float = 0.3):
+        # 应用周期边界条件
+            self.atoms.set_scaled_positions(self.atoms.get_scaled_positions() % 1.0)
+        # Update atom order
+
+    def perturb_atom_order(self, swap_probability: float = 0.3,different_elements_only=False):
         """
         Randomly swap atoms to increase exploration
 
@@ -161,6 +172,9 @@ class Particle:
             if n_atoms >= 2:
                 # Randomly select two different atoms to swap
                 i, j = random.sample(range(n_atoms), 2)
+
+                if (not different_elements_only or self.atoms.get_chemical_symbols()[i] != self.atoms.get_chemical_symbols()[j]):
+                    self.atom_order[i], self.atom_order[j] = self.atom_order[j], self.atom_order[i]
 
                 # Only swap different elements (optional)
                 if self.atoms.get_chemical_symbols()[i] != self.atoms.get_chemical_symbols()[j]:
@@ -207,6 +221,7 @@ class PSO(Optimizer):
             cognitive: float = 2.0,
             social: float = 2.0,
             swap_probability: float = 0.2,
+            different_elements_only: bool = False,
             finalize_with_lbfgs: bool = True,
             **kwargs
     ):
@@ -230,6 +245,17 @@ class PSO(Optimizer):
             finalize_with_lbfgs: Whether to refine with LBFGS at the end
             **kwargs: Additional arguments passed to parent class
         """
+        # 从kwargs中提取PSO特定参数，以免传递给父类
+        self.fix_cell = kwargs.pop('fix_cell', True)
+        max_iterations = kwargs.pop('max_iterations', 1000)
+
+        # 删除任何额外的不支持的参数以避免传递给父类
+        # 这些是用户代码中可能出现的参数
+        for param in ['entropy_weight', 'use_device', 'check_cuda_mem',
+                      'stress_weight', 'on_isolated_atoms', 'return_site_energies']:
+            if param in kwargs:
+                kwargs.pop(param)
+
         Optimizer.__init__(self, atoms, restart, logfile, trajectory, master, **kwargs)
 
         # PSO parameters
@@ -241,12 +267,13 @@ class PSO(Optimizer):
         self.cognitive = cognitive
         self.social = social
         self.swap_probability = swap_probability
+        self.different_elements_only = different_elements_only
         self.finalize_with_lbfgs = finalize_with_lbfgs
+        # 设置最大迭代次数
+        self.max_iterations = max_iterations
+        # self.entropy_weight = entropy_weight,  # 添加熵权重参数
 
-        # Fix cell if specified in convergence criteria
-        self.fix_cell = kwargs.get('fix_cell', True)
-        if 'fix_cell' in kwargs:
-            del kwargs['fix_cell']
+
 
         # Initialize particles
         self.particles = [
@@ -266,7 +293,7 @@ class PSO(Optimizer):
 
         # Iteration counter
         self.iteration = 0
-        self.max_iterations = 1000  # Can be set by caller
+        # self.max_iterations = 1000  # Can be set by caller
 
         # Initialize first particle
         self.calculate_energy_forces(self.particles[0])
@@ -300,7 +327,7 @@ class PSO(Optimizer):
                 particle.update_position(fix_cell=self.fix_cell)
 
                 # Perturb atom order
-                particle.perturb_atom_order(swap_probability=self.swap_probability)
+                particle.perturb_atom_order(swap_probability=self.swap_probability,different_elements_only=self.different_elements_only)
 
                 # Evaluate energy and forces
                 self.calculate_energy_forces(particle)
