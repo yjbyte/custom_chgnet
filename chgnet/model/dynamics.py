@@ -216,15 +216,14 @@ class CHGNetCalculator(Calculator):
         if self.return_site_energies:
             self.results["energies"] = model_prediction["site_energies"]
 
-            # 添加熵的计算与贡献
-            if self.entropy_weight > 0:
-                configurational_entropy = self.calculate_configurational_entropy(atoms)
-                # 熵贡献（负号是因为熵增加通常对应能量降低）
-                entropy_contribution = -self.entropy_weight * configurational_entropy
-
-                # 将熵贡献加入到能量中
-                self.results["energy"] += entropy_contribution
-                self.results["free_energy"] = self.results["energy"]
+        # 添加熵的计算与贡献
+        if self.entropy_weight > 0:
+            configurational_entropy = self.calculate_configurational_entropy(atoms)
+            # 熵贡献（负号是因为熵增加通常对应能量降低）
+            entropy_contribution = -self.entropy_weight * configurational_entropy
+            # 将熵贡献加入到能量中
+            self.results["energy"] += entropy_contribution
+            self.results["free_energy"] = self.results["energy"]
 
 
 
