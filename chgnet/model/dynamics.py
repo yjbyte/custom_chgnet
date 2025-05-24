@@ -8,9 +8,6 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Literal
 
-
-from chgnet.model.pso_optimizer import PSO
-from scipy.constants import R as GAS_CONSTANT
 import numpy as np
 from ase import Atoms, units
 from ase.calculators.calculator import (
@@ -55,7 +52,6 @@ OPTIMIZERS = {
     "SciPyFminCG": SciPyFminCG,
     "SciPyFminBFGS": SciPyFminBFGS,
     "BFGSLineSearch": BFGSLineSearch,
-    "PSO": PSO,  # 添加PSO优化器
 }
 
 
@@ -73,7 +69,6 @@ class CHGNetCalculator(Calculator):
         stress_weight: float = units.GPa,  # GPa to eV/A^3
         on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
         return_site_energies: bool = False,
-        entropy_weight: float = 0.0,  # 添加熵权重参数
         **kwargs,
     ) -> None:
         """Provide a CHGNet instance to calculate various atomic properties using ASE.
@@ -110,7 +105,6 @@ class CHGNetCalculator(Calculator):
         self.model.graph_converter.set_isolated_atom_response(on_isolated_atoms)
         self.stress_weight = stress_weight
         self.return_site_energies = return_site_energies
-        self.entropy_weight = entropy_weight  # 保存熵权重参数
         print(f"CHGNet will run on {self.device}")
 
     @classmethod
@@ -131,32 +125,6 @@ class CHGNetCalculator(Calculator):
     def n_params(self) -> int:
         """The number of parameters in CHGNet."""
         return self.model.n_params
-
-
-    ## 计算构型熵
-    def calculate_configurational_entropy(self, atoms: Atoms) -> float:
-        """
-        计算原子结构的构型熵。
-        Args:
-            atoms: ASE Atoms对象
-        Returns:
-            float: 构型熵，单位为eV/K
-        """
-        # 获取原子序数并计算元素频率
-        atomic_numbers = atoms.get_atomic_numbers()
-        unique_elements, counts = np.unique(atomic_numbers, return_counts=True)
-        # 计算原子分数
-        total_atoms = len(atomic_numbers)
-        atomic_fractions = counts / total_atoms
-        # 使用玻尔兹曼熵公式计算: S_conf = -R * sum(c_i * ln(c_i))
-        # 将R从J/(mol·K)转换为eV/K以与CHGNet能量单位保持一致
-        R_eV = GAS_CONSTANT / 96485.3  # 转换为eV/K
-        entropy = 0
-        for fraction in atomic_fractions:
-            if fraction > 0:  # 避免ln(0)
-                entropy -= fraction * np.log(fraction)
-        entropy *= R_eV
-        return entropy
 
     def calculate(
         self,
@@ -202,30 +170,15 @@ class CHGNetCalculator(Calculator):
             m=("magmoms", 1),
             s=("stress", self.stress_weight),
         )
-
         self.results |= {
             long_key: model_prediction[key] * factor
             for key, (long_key, factor) in key_map.items()
             if key in model_prediction
         }
-
-
-
         self.results["free_energy"] = self.results["energy"]
         self.results["crystal_fea"] = model_prediction["crystal_fea"]
         if self.return_site_energies:
             self.results["energies"] = model_prediction["site_energies"]
-
-        # 添加熵的计算与贡献
-        if self.entropy_weight > 0:
-            configurational_entropy = self.calculate_configurational_entropy(atoms)
-            # 熵贡献（负号是因为熵增加通常对应能量降低）
-            entropy_contribution = -self.entropy_weight * configurational_entropy
-            # 将熵贡献加入到能量中
-            self.results["energy"] += entropy_contribution
-            self.results["free_energy"] = self.results["energy"]
-
-
 
 
 class StructOptimizer:
@@ -238,7 +191,6 @@ class StructOptimizer:
         use_device: str | None = None,
         stress_weight: float = units.GPa,
         on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
-        entropy_weight: float = 0.0,  # 添加熵权重参数
     ) -> None:
         """Provide a trained CHGNet model and an optimizer to relax crystal structures.
 
@@ -276,7 +228,6 @@ class StructOptimizer:
                 stress_weight=stress_weight,
                 use_device=use_device,
                 on_isolated_atoms=on_isolated_atoms,
-                entropy_weight=entropy_weight,  # 传递熵权重参数
             )
 
     @property
@@ -290,31 +241,19 @@ class StructOptimizer:
         return self.calculator.model.n_params
 
     def relax(
-            self,
-            atoms: Structure | Atoms,
-            *,
-            fmax: float | None = 0.1,
-            steps: int | None = 500,
-            relax_cell: bool | None = True,
-            ase_filter: str | None = "FrechetCellFilter",
-            save_path: str | None = None,
-            loginterval: int | None = 1,
-            crystal_feas_save_path: str | None = None,
-            verbose: bool = True,
-            assign_magmoms: bool = True,
-            # 添加新参数
-            swap_atoms: bool = False,
-            swap_probability: float = 0.2,
-            different_elements_only: bool = False,
-            perturb_structure: bool = False,
-            perturbation_amplitude: float = 0.1,
-            distort_lattice: bool = False,
-            strain_range: float = 0.05,
-            symmetric_strain: bool = True,
-            # 添加PSO相关参数
-            use_pso: bool = False,
-            n_particles: int = 10,
-            **kwargs,
+        self,
+        atoms: Structure | Atoms,
+        *,
+        fmax: float | None = 0.1,
+        steps: int | None = 500,
+        relax_cell: bool | None = True,
+        ase_filter: str | None = "FrechetCellFilter",
+        save_path: str | None = None,
+        loginterval: int | None = 1,
+        crystal_feas_save_path: str | None = None,
+        verbose: bool = True,
+        assign_magmoms: bool = True,
+        **kwargs,
     ) -> dict[str, Structure | TrajectoryObserver]:
         """Relax the Structure/Atoms until maximum force is smaller than fmax.
 
@@ -328,6 +267,9 @@ class StructOptimizer:
                 Default = True
             ase_filter (str | ase.filters.Filter): The filter to apply to the atoms
                 object for relaxation. Default = FrechetCellFilter
+                Default used to be ExpCellFilter which was removed due to bug reported
+                in https://gitlab.com/ase/ase/-/issues/1321 and fixed in
+                https://gitlab.com/ase/ase/-/merge_requests/3024.
             save_path (str | None): The path to save the trajectory.
                 Default = None
             loginterval (int | None): Interval for logging trajectory and crystal
@@ -339,22 +281,6 @@ class StructOptimizer:
                 Default = True
             assign_magmoms (bool): Whether to assign magnetic moments to the final
                 structure. Default = True
-            swap_atoms (bool): Whether to swap atom positions before optimization.
-                Default = False
-            swap_probability (float): Probability of atom swapping.
-                Default = 0.2
-            different_elements_only (bool): Whether to only swap atoms of different elements.
-                Default = False
-            perturb_structure (bool): Whether to add random perturbations to atom positions.
-                Default = False
-            perturbation_amplitude (float): Maximum amplitude of perturbations in Angstroms.
-                Default = 0.1
-            distort_lattice (bool): Whether to apply random strain to the lattice.
-                Default = False
-            strain_range (float): Maximum strain to apply to the lattice.
-                Default = 0.05
-            symmetric_strain (bool): Whether to apply symmetric (isotropic) strain.
-                Default = True
             **kwargs: Additional parameters for the optimizer.
 
         Returns:
@@ -381,7 +307,6 @@ class StructOptimizer:
         if isinstance(atoms, Structure):
             atoms = AseAtomsAdaptor().get_atoms(atoms)
 
-        # 以下是原有代码
         atoms.calc = self.calculator  # assign model used to predict forces
 
         stream = sys.stdout if verbose else io.StringIO()
@@ -390,69 +315,35 @@ class StructOptimizer:
 
             if crystal_feas_save_path:
                 cry_obs = CrystalFeasObserver(atoms)
-#todo
-            # 选择优化器
-            if use_pso or (hasattr(self, 'optimizer_class') and
-                           (self.optimizer_class == PSO or
-                            (isinstance(self.optimizer_class, str) and
-                             self.optimizer_class.upper() == "PSO"))):
-                # 使用PSO优化器
-                # 只传递PSO支持的参数
-                pso_kwargs = {
-                    'fix_cell': not relax_cell,
-                    'max_iterations': steps,
-                    'n_particles': n_particles,
-                    'swap_probability': swap_probability,
-                    'different_elements_only': different_elements_only,
-                }
 
-                # 从kwargs中提取可能传递给PSO的其他参数
-                supported_pso_params = ['inertia_start', 'inertia_end', 'cognitive', 'social',
-                                        'velocity_scale', 'position_scale', 'finalize_with_lbfgs']
-
-                for key in supported_pso_params:
-                    if key in kwargs:
-                        pso_kwargs[key] = kwargs.pop(key)
-
-                # 过滤掉任何不支持的参数
-                additional_kwargs = {}
-                for key in ['trajectory', 'restart', 'master']:
-                    if key in kwargs:
-                        additional_kwargs[key] = kwargs.pop(key)
-
-                optimizer = PSO(
-                    atoms,
-                    logfile=stream if verbose else None,
-                    **pso_kwargs,
-                    **additional_kwargs
-                )
-            else:
-                # 使用常规优化器
-                optimizer = self.optimizer_class(atoms, **kwargs)
+            if relax_cell:
+                atoms = ase_filter(atoms)
+            optimizer: Optimizer = self.optimizer_class(atoms, **kwargs)
             optimizer.attach(obs, interval=loginterval)
+
             if crystal_feas_save_path:
                 optimizer.attach(cry_obs, interval=loginterval)
+
             optimizer.run(fmax=fmax, steps=steps)
             obs()
 
-            if save_path is not None:
-                obs.save(save_path)
+        if save_path is not None:
+            obs.save(save_path)
 
-            if crystal_feas_save_path:
-                cry_obs.save(crystal_feas_save_path)
+        if crystal_feas_save_path:
+            cry_obs.save(crystal_feas_save_path)
 
-            if isinstance(atoms, Filter):
-                atoms = atoms.atoms
-            struct = AseAtomsAdaptor.get_structure(atoms)
+        if isinstance(atoms, Filter):
+            atoms = atoms.atoms
+        struct = AseAtomsAdaptor.get_structure(atoms)
 
-            if assign_magmoms:
-                for key in struct.site_properties:
-                    struct.remove_site_property(property_name=key)
-                struct.add_site_property(
-                    "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
-                )
-            return {"final_structure": struct, "trajectory": obs}
-
+        if assign_magmoms:
+            for key in struct.site_properties:
+                struct.remove_site_property(property_name=key)
+            struct.add_site_property(
+                "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
+            )
+        return {"final_structure": struct, "trajectory": obs}
 
 
 class TrajectoryObserver:
@@ -1025,8 +916,3 @@ class EquationOfState:
         if unit in {"Pa^-1", "m^2/N"}:
             return 1 / (self.bm.b0_GPa * 1e9)
         raise NotImplementedError("unit has to be one of A^3/eV, GPa^-1 Pa^-1 or m^2/N")
-
-
-
-
-
