@@ -240,6 +240,7 @@ class StructOptimizer:
         """The number of parameters in CHGNet."""
         return self.calculator.model.n_params
 
+
     def relax(
         self,
         atoms: Structure | Atoms,
@@ -344,6 +345,7 @@ class StructOptimizer:
                 "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
             )
         return {"final_structure": struct, "trajectory": obs}
+
 
 
 class TrajectoryObserver:
