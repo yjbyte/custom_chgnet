@@ -1,7 +1,7 @@
 """
-PSO粒子表示模块
+PSO粒子表示和种群管理模块
 
-实现阶段一PSO的粒子数据结构，用于描述晶体中原子在位点群内的排列方式
+实现阶段一PSO的粒子数据结构和种群初始化功能
 """
 
 from __future__ import annotations
@@ -167,3 +167,85 @@ class PSOParticle:
     
     def __repr__(self) -> str:
         return self.__str__()
+
+
+# 种群管理函数
+
+def initialize_population(
+    population_size: int,
+    site_groups_definition: Dict[str, Dict],
+    random_seed: int = None
+) -> List[PSOParticle]:
+    """
+    初始化PSO粒子种群
+    
+    Args:
+        population_size (int): 种群大小
+        site_groups_definition (Dict[str, Dict]): 位点群定义
+        random_seed (int, optional): 随机种子
+        
+    Returns:
+        List[PSOParticle]: 初始化的粒子种群列表
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
+    population = []
+    
+    for i in range(population_size):
+        particle = PSOParticle(site_groups_definition)
+        
+        # 应用不同的随机化策略增加多样性
+        for group_name in particle.site_groups_arrangement.keys():
+            if i % 3 == 0:
+                _randomize_group_arrangement(particle, group_name)
+            elif i % 3 == 1:
+                _local_shuffle_group(particle, group_name)
+            else:
+                _segment_shuffle_group(particle, group_name)
+        
+        population.append(particle)
+    
+    return population
+
+
+def _randomize_group_arrangement(particle: PSOParticle, group_name: str):
+    """对位点群进行完全随机排列"""
+    arrangement = particle.site_groups_arrangement[group_name].copy()
+    np.random.shuffle(arrangement)
+    particle.site_groups_arrangement[group_name] = arrangement
+
+
+def _local_shuffle_group(particle: PSOParticle, group_name: str):
+    """对位点群进行局部随机交换"""
+    arrangement = particle.site_groups_arrangement[group_name].copy()
+    n = len(arrangement)
+    
+    num_swaps = max(1, n // 3)
+    for _ in range(num_swaps):
+        i = np.random.randint(0, n)
+        j = np.random.randint(max(0, i-2), min(n, i+3))
+        arrangement[i], arrangement[j] = arrangement[j], arrangement[i]
+    
+    particle.site_groups_arrangement[group_name] = arrangement
+
+
+def _segment_shuffle_group(particle: PSOParticle, group_name: str):
+    """对位点群进行分段随机排列"""
+    arrangement = particle.site_groups_arrangement[group_name].copy()
+    n = len(arrangement)
+    
+    if n <= 2:
+        np.random.shuffle(arrangement)
+    else:
+        num_segments = np.random.randint(2, min(4, n+1))
+        segment_boundaries = np.sort(np.random.choice(range(1, n), num_segments-1, replace=False))
+        segment_boundaries = np.concatenate([[0], segment_boundaries, [n]])
+        
+        for i in range(len(segment_boundaries) - 1):
+            start, end = segment_boundaries[i], segment_boundaries[i+1]
+            segment = arrangement[start:end].copy()
+            np.random.shuffle(segment)
+            arrangement[start:end] = segment
+    
+    particle.site_groups_arrangement[group_name] = arrangement
