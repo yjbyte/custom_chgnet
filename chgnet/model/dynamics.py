@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import contextlib
+# 添加新的导入
+import csv
 import inspect
 import io
+import os
 import pickle
 import sys
 import warnings
-from typing import TYPE_CHECKING, Literal
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Callable
+from typing import Literal
+from typing import TYPE_CHECKING
 
 import numpy as np
 from ase import Atoms, units
 from ase.calculators.calculator import (
     BaseCalculator,
     Calculator,
-    all_changes,
-    all_properties,
 )
+from ase.calculators.calculator import all_changes, all_properties
 from ase.md.npt import NPT
 from ase.md.nptberendsen import Inhomogeneous_NPTBerendsen, NPTBerendsen, NVTBerendsen
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -55,21 +60,212 @@ OPTIMIZERS = {
 }
 
 
+def load_atomic_radii(csv_path: Optional[str] = None) -> Dict[str, float]:
+    """
+    加载原子半径数据，从CSV文件中读取原子的离子半径。
+
+    Args:
+        csv_path (str, optional): 原子半径数据CSV文件的路径。如果为None，则使用默认路径。
+
+    Returns:
+        Dict[str, float]: 原子符号到离子半径(pm)的映射字典
+    """
+    if csv_path is None:
+        # 假设CSV文件位于chgnet/data/目录下
+        module_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        csv_path = os.path.join(module_dir, 'data', 'Atomic_radius_table.csv')
+
+    atomic_radii = {}
+
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                atom = row['Atom'].strip()
+                # 按顺序检查A、B、O三列，使用第一个非空值
+                radius = None
+                for col in ['Ion radius at site A', 'Ion radius at site B', 'Ion radius at site O']:
+                    if row[col] and row[col].strip():
+                        radius = float(row[col].strip())
+                        break
+
+                if radius is not None:
+                    atomic_radii[atom] = radius
+    except Exception as e:
+        print(f"加载原子半径数据时出错: {e}")
+
+    return atomic_radii
+
+
+def simple_pso(
+        objective_func: Callable[[np.ndarray], float],
+        bounds: List[Tuple[float, float]],
+        n_particles: int = 20,
+        max_iter: int = 100,
+        c1: float = 0.5,
+        c2: float = 0.5,
+        w: float = 0.9
+) -> Tuple[np.ndarray, float]:
+    """
+    一个粒子群优化(PSO)算法实现。
+
+    Args:
+        objective_func: 目标函数，接收粒子位置(numpy数组)并返回一个标量值
+        bounds: 每个维度的搜索范围，格式为[(min_1, max_1), (min_2, max_2), ...]
+        n_particles: 粒子数量
+        max_iter: 最大迭代次数
+        c1: 认知参数
+        c2: 社会参数
+        w: 惯性权重
+
+    Returns:
+        Tuple[np.ndarray, float]: 最优位置和对应的目标函数值
+    """
+    # 获取问题维度
+    dim = len(bounds)
+
+    # 设置速度限制（基于搜索空间的大小）
+    v_bounds = []
+    for i in range(dim):
+        v_min = -(bounds[i][1] - bounds[i][0]) * 0.25  # 速度限制为搜索范围的10%
+        v_max = (bounds[i][1] - bounds[i][0]) * 0.25
+        v_bounds.append((v_min, v_max))
+
+    # 初始化粒子位置和速度
+    positions = np.zeros((n_particles, dim))
+    velocities = np.zeros((n_particles, dim))
+
+    # 随机初始化粒子位置和速度
+    for i in range(dim):
+        positions[:, i] = np.random.uniform(
+            bounds[i][0], bounds[i][1], size=n_particles
+        )
+        velocities[:, i] = np.random.uniform(
+            v_bounds[i][0], v_bounds[i][1], size=n_particles
+        )
+
+    # 初始化每个粒子的最佳位置和值
+    pbest_pos = positions.copy()
+    pbest_val = np.array([objective_func(pos) for pos in positions])
+
+    # 初始化全局最佳位置和值
+    gbest_idx = np.argmin(pbest_val)
+    gbest_pos = pbest_pos[gbest_idx].copy()
+    gbest_val = pbest_val[gbest_idx]
+
+    # 主循环
+    for _ in range(max_iter):
+        # 更新每个粒子
+        for i in range(n_particles):
+            # 生成随机系数
+            r1 = np.random.random(dim)
+            r2 = np.random.random(dim)
+
+            # 更新速度
+            cognitive_velocity = c1 * r1 * (pbest_pos[i] - positions[i])
+            social_velocity = c2 * r2 * (gbest_pos - positions[i])
+            velocities[i] = w * velocities[i] + cognitive_velocity + social_velocity
+
+            # 应用速度限制
+            for j in range(dim):
+                velocities[i, j] = np.clip(velocities[i, j], v_bounds[j][0], v_bounds[j][1])
+
+            # 更新位置
+            positions[i] += velocities[i]
+
+            # 应用位置边界限制
+            for j in range(dim):
+                positions[i, j] = np.clip(positions[i, j], bounds[j][0], bounds[j][1])
+
+            # 评估新位置
+            val = objective_func(positions[i])
+
+            # 更新粒子最佳位置
+            if val < pbest_val[i]:
+                pbest_pos[i] = positions[i].copy()
+                pbest_val[i] = val
+
+                # 更新全局最佳位置
+                if val < gbest_val:
+                    gbest_pos = positions[i].copy()
+                    gbest_val = val
+
+    # 返回全局最优位置和对应的值
+    return gbest_pos, gbest_val
+
+
+def calculate_distance_entropy(structure: Structure, bin_width: float = 0.2, cutoff: float = 10.0) -> float:
+    """
+    计算基于同种元素间距分布的构型熵。
+
+    Args:
+        structure (Structure): Pymatgen Structure对象。
+        bin_width (float): 距离分布直方图的分箱宽度 (Å)。
+        cutoff (float): 计算原子间距时考虑的最大距离 (Å)。
+
+    Returns:
+        float: 计算得到的构型熵值 (k=1)。
+    """
+    # a. 按元素分组
+    sites_by_element = defaultdict(list)
+    for site in structure:
+        sites_by_element[site.specie.symbol].append(site)
+
+    all_distances = []
+    # b. 计算同种元素间距
+    for symbol, sites in sites_by_element.items():
+        if len(sites) < 2:
+            continue
+
+        coords = np.array([site.coords for site in sites])
+
+        # 计算该组内所有唯一原子对之间的距离
+        # 使用itertools.combinations来获取所有唯一的对
+        from itertools import combinations
+        for i, j in combinations(range(len(coords)), 2):
+            dist = np.linalg.norm(coords[i] - coords[j])
+            if dist < cutoff:
+                all_distances.append(dist)
+
+    # c. 处理空距离
+    if not all_distances:
+        return 0.0
+
+    # d. 分箱与概率计算
+    bins = np.arange(0, cutoff + bin_width, bin_width)
+    hist, _ = np.histogram(all_distances, bins=bins)
+
+    # 只考虑非零计数的箱
+    non_zero_hist = hist[hist > 0]
+
+    if non_zero_hist.size == 0:
+        return 0.0
+
+    total_count = np.sum(non_zero_hist)
+    probabilities = non_zero_hist / total_count
+
+    # e. 计算香农熵 (k=1)
+    entropy = -np.sum(probabilities * np.log(probabilities))
+
+    # f. 返回熵值
+    return entropy
+
+
 class CHGNetCalculator(Calculator):
     """CHGNet Calculator for ASE applications."""
 
     implemented_properties = ("energy", "forces", "stress", "magmoms", "energies")
 
     def __init__(
-        self,
-        model: CHGNet | None = None,
-        *,
-        use_device: str | None = None,
-        check_cuda_mem: bool = False,
-        stress_weight: float = units.GPa,  # GPa to eV/A^3
-        on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
-        return_site_energies: bool = False,
-        **kwargs,
+            self,
+            model: CHGNet | None = None,
+            *,
+            use_device: str | None = None,
+            check_cuda_mem: bool = False,
+            stress_weight: float = units.GPa,  # GPa to eV/A^3
+            on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
+            return_site_energies: bool = False,
+            **kwargs,
     ) -> None:
         """Provide a CHGNet instance to calculate various atomic properties using ASE.
 
@@ -127,11 +323,11 @@ class CHGNetCalculator(Calculator):
         return self.model.n_params
 
     def calculate(
-        self,
-        atoms: Atoms | None = None,
-        properties: list | None = None,
-        system_changes: list | None = None,
-        task: PredTask = "efsm",
+            self,
+            atoms: Atoms | None = None,
+            properties: list | None = None,
+            system_changes: list | None = None,
+            task: PredTask = "efsm",
     ) -> None:
         """Calculate various properties of the atoms using CHGNet.
 
@@ -185,12 +381,12 @@ class StructOptimizer:
     """Wrapper class for structural relaxation."""
 
     def __init__(
-        self,
-        model: CHGNet | CHGNetCalculator | None = None,
-        optimizer_class: Optimizer | str | None = "FIRE",
-        use_device: str | None = None,
-        stress_weight: float = units.GPa,
-        on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
+            self,
+            model: CHGNet | CHGNetCalculator | None = None,
+            optimizer_class: Optimizer | str | None = "FIRE",
+            use_device: str | None = None,
+            stress_weight: float = units.GPa,
+            on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
     ) -> None:
         """Provide a trained CHGNet model and an optimizer to relax crystal structures.
 
@@ -240,28 +436,27 @@ class StructOptimizer:
         """The number of parameters in CHGNet."""
         return self.calculator.model.n_params
 
-
     def relax(
-        self,
-        atoms: Structure | Atoms,
-        *,
-        fmax: float | None = 0.1,
-        steps: int | None = 500,
-        relax_cell: bool | None = True,
-        ase_filter: str | None = "FrechetCellFilter",
-        save_path: str | None = None,
-        loginterval: int | None = 1,
-        crystal_feas_save_path: str | None = None,
-        verbose: bool = True,
-        assign_magmoms: bool = True,
-        **kwargs,
+            self,
+            atoms: Structure | Atoms,
+            *,
+            fmax: float | None = 0.3,
+            steps: int | None = 500,
+            relax_cell: bool | None = True,
+            ase_filter: str | None = "FrechetCellFilter",
+            save_path: str | None = None,
+            loginterval: int | None = 1,
+            crystal_feas_save_path: str | None = None,
+            verbose: bool = True,
+            assign_magmoms: bool = True,
+            **kwargs,
     ) -> dict[str, Structure | TrajectoryObserver]:
         """Relax the Structure/Atoms until maximum force is smaller than fmax.
 
         Args:
             atoms (Structure | Atoms): A Structure or Atoms object to relax.
             fmax (float | None): The maximum force tolerance for relaxation.
-                Default = 0.1
+                Default = 0.3
             steps (int | None): The maximum number of steps for relaxation.
                 Default = 500
             relax_cell (bool | None): Whether to relax the cell as well.
@@ -345,6 +540,143 @@ class StructOptimizer:
                 "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
             )
         return {"final_structure": struct, "trajectory": obs}
+
+    def relax_pso(self, atoms: Structure, n_particles: int = 10, max_iter: int = 50, c1: float = 0.5, c2: float = 0.5,
+                  w: float = 0.9, use_entropy: bool = False, temperature: float = 0.1,
+                  entropy_bin_width: float = 0.2, entropy_cutoff: float = 10.0) -> Structure:
+        """
+        使用粒子群优化(PSO)对晶体结构进行优化。
+        通过在原子坐标上施加小的扰动来寻找能量最低的结构配置。
+
+        Args:
+            atoms (Structure): 要优化的Pymatgen Structure对象
+            n_particles (int): PSO算法中的粒子数量，默认为20
+            max_iter (int): PSO算法的最大迭代次数，默认为50
+            c1 (float): PSO的认知参数，默认为0.5
+            c2 (float): PSO的社会参数，默认为0.5
+            w (float): PSO的惯性权重，默认为0.9
+            use_entropy (bool): 是否在优化目标中包含构型熵。默认为 False。
+            temperature (float): 熵的贡献权重因子 T。默认为 0.1。
+            entropy_bin_width (float): 熵计算中距离分箱的宽度。默认为 0.2。
+            entropy_cutoff (float): 熵计算中原子间距的最大截断距离。默认为 10.0。
+
+        Returns:
+            Structure: 优化后的晶体结构
+        """
+        # 1. 获取原子符号和离子半径映射
+        atomic_radii = load_atomic_radii()
+        default_radius = 120.0  # 默认半径值(pm)
+
+        # 2. 获取结构信息
+        n_atoms = len(atoms)
+        species = [site.specie.symbol for site in atoms]
+
+        # 获取初始分数坐标
+        initial_frac_coords = np.array([site.frac_coords for site in atoms])
+
+        # 3. 计算每个原子的最大位移边界
+        bounds = []
+
+        for i, atom_symbol in enumerate(species):
+            # 查找原子半径，如果不存在则使用默认值
+            radius_pm = atomic_radii.get(atom_symbol, default_radius)
+
+            # 计算笛卡尔坐标系下的最大位移(Å)
+            # 半径从pm转换为Å(除以100)，然后乘以10%
+            max_displacement_A = radius_pm / 100.0 * 0.25
+
+            # 将笛卡尔坐标下的最大位移转换为分数坐标
+            lattice_inv = atoms.lattice.inv_matrix
+
+            # 计算三个轴方向上的最大分数坐标位移
+            cart_displacements = [
+                [max_displacement_A, 0, 0],  # x方向
+                [0, max_displacement_A, 0],  # y方向
+                [0, 0, max_displacement_A]  # z方向
+            ]
+
+            # 计算这些笛卡尔位移在分数坐标下的大小
+            frac_displacements = []
+            for cart_disp in cart_displacements:
+                frac_disp = np.dot(lattice_inv, cart_disp)
+                frac_displacements.append(np.linalg.norm(frac_disp))
+
+            # 设置x, y, z三个方向的边界
+            for j in range(3):
+                # 分数坐标下的边界
+                bounds.append((-frac_displacements[j], frac_displacements[j]))
+
+        # 4. 定义目标函数
+        def objective_function(particle_position: np.ndarray) -> float:
+            """
+            PSO优化的目标函数，计算给定原子位移下结构的能量。
+            如果use_entropy为True，则返回 E_CHGNet - T * S_dist。
+
+            Args:
+                particle_position (np.ndarray): 所有原子的位移向量，格式为[dx1, dy1, dz1, dx2, dy2, dz2, ...]
+
+            Returns:
+                float: 结构的能量值（可能包含熵贡献）。
+            """
+            # 重塑位移向量为(n_atoms, 3)形状
+            displacements = particle_position.reshape((-1, 3))
+
+            # 计算新的分数坐标
+            new_frac_coords = initial_frac_coords + displacements
+
+            # 创建一个新的结构对象
+            new_structure = atoms.copy()
+
+            # 更新所有原子的位置
+            for i in range(n_atoms):
+                new_structure.replace(i, species[i], new_frac_coords[i], properties=atoms[i].properties)
+
+            # 使用CHGNet计算能量
+            prediction = self.calculator.model.predict_structure(new_structure, task='e')
+            energy_chgnet = float(prediction['e'])
+
+            if use_entropy:
+                s_dist = calculate_distance_entropy(
+                    new_structure,
+                    bin_width=entropy_bin_width,
+                    cutoff=entropy_cutoff
+                )
+                return energy_chgnet - temperature * s_dist
+            else:
+                return energy_chgnet
+
+        # 5. 调用PSO优化器
+        print(f"开始PSO优化，使用 {n_particles} 个粒子和 {max_iter} 次迭代...")
+        if use_entropy:
+            print(f"熵优化已启用: T = {temperature}, bin_width = {entropy_bin_width}, cutoff = {entropy_cutoff}")
+
+        gbest_position, gbest_energy = simple_pso(
+            objective_func=objective_function,
+            bounds=bounds,
+            n_particles=n_particles,
+            max_iter=max_iter,
+            c1=c1,
+            c2=c2,
+            w=w
+        )
+        print(f"PSO优化完成，最佳目标函数值: {gbest_energy}")
+
+        # 6. 处理优化结果
+        # 重塑最佳位置为(n_atoms, 3)形状
+        best_displacements = gbest_position.reshape((-1, 3))
+
+        # 计算最终的原子分数坐标
+        final_frac_coords = initial_frac_coords + best_displacements
+
+        # 创建最终结构
+        final_structure = atoms.copy()
+
+        # 更新所有原子的位置
+        for i in range(n_atoms):
+            final_structure.replace(i, species[i], final_frac_coords[i], properties=atoms[i].properties)
+
+        # 7. 返回优化后的结构
+        return final_structure
 
 
 
@@ -436,27 +768,27 @@ class MolecularDynamics:
     """Molecular dynamics class."""
 
     def __init__(
-        self,
-        atoms: Atoms | Structure,
-        *,
-        model: CHGNet | CHGNetCalculator | None = None,
-        ensemble: str = "nvt",
-        thermostat: str = "Berendsen_inhomogeneous",
-        temperature: int = 300,
-        starting_temperature: int | None = None,
-        timestep: float = 2.0,
-        pressure: float = 1.01325e-4,
-        taut: float | None = None,
-        taup: float | None = None,
-        bulk_modulus: float | None = None,
-        trajectory: str | Trajectory | None = None,
-        logfile: str | None = None,
-        loginterval: int = 1,
-        crystal_feas_logfile: str | None = None,
-        append_trajectory: bool = False,
-        on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
-        return_site_energies: bool = False,
-        use_device: str | None = None,
+            self,
+            atoms: Atoms | Structure,
+            *,
+            model: CHGNet | CHGNetCalculator | None = None,
+            ensemble: str = "nvt",
+            thermostat: str = "Berendsen_inhomogeneous",
+            temperature: int = 300,
+            starting_temperature: int | None = None,
+            timestep: float = 2.0,
+            pressure: float = 1.01325e-4,
+            taut: float | None = None,
+            taup: float | None = None,
+            bulk_modulus: float | None = None,
+            trajectory: str | Trajectory | None = None,
+            logfile: str | None = None,
+            loginterval: int = 1,
+            crystal_feas_logfile: str | None = None,
+            append_trajectory: bool = False,
+            on_isolated_atoms: Literal["ignore", "warn", "error"] = "warn",
+            return_site_energies: bool = False,
+            use_device: str | None = None,
     ) -> None:
         """Initialize the MD class.
 
@@ -585,7 +917,7 @@ class MolecularDynamics:
                     timestep=timestep * units.fs,
                     temperature_K=temperature,
                     externalstress=pressure
-                    * units.GPa,  # ase NPT does not like externalstress=None
+                                   * units.GPa,  # ase NPT does not like externalstress=None
                     ttime=taut * units.fs,
                     pfactor=None,
                     trajectory=trajectory,
@@ -627,7 +959,7 @@ class MolecularDynamics:
                 try:
                     # Fit bulk modulus by equation of state
                     eos = EquationOfState(model=self.atoms.calc)
-                    eos.fit(atoms=atoms, steps=500, fmax=0.1, verbose=False)
+                    eos.fit(atoms=atoms, steps=500, fmax=0.3, verbose=False)
                     bulk_modulus = eos.get_bulk_modulus(unit="GPa")
                     bulk_modulus_au = eos.get_bulk_modulus(unit="eV/A^3")
                     compressibility_au = eos.get_compressibility(unit="A^3/eV")
@@ -769,7 +1101,7 @@ class MolecularDynamics:
             cos_a, cos_b, cos_g = np.cos(angles)
             cos_p = (cos_g - cos_a * cos_b) / (sin_a * sin_b)
             cos_p = np.clip(cos_p, -1, 1)
-            sin_p = (1 - cos_p**2) ** 0.5
+            sin_p = (1 - cos_p ** 2) ** 0.5
 
             new_basis = [
                 (a * sin_b * sin_p, a * sin_b * cos_p, a * cos_b),
@@ -786,12 +1118,12 @@ class EquationOfState:
     """Class to calculate equation of state."""
 
     def __init__(
-        self,
-        model: CHGNet | CHGNetCalculator | None = None,
-        optimizer_class: Optimizer | str | None = "FIRE",
-        use_device: str | None = None,
-        stress_weight: float = units.GPa,
-        on_isolated_atoms: Literal["ignore", "warn", "error"] = "error",
+            self,
+            model: CHGNet | CHGNetCalculator | None = None,
+            optimizer_class: Optimizer | str | None = "FIRE",
+            use_device: str | None = None,
+            stress_weight: float = units.GPa,
+            on_isolated_atoms: Literal["ignore", "warn", "error"] = "error",
     ) -> None:
         """Initialize a structure optimizer object for calculation of bulk modulus.
 
@@ -821,14 +1153,14 @@ class EquationOfState:
         self.fitted = False
 
     def fit(
-        self,
-        atoms: Structure | Atoms,
-        *,
-        n_points: int = 11,
-        fmax: float | None = 0.1,
-        steps: int | None = 500,
-        verbose: bool | None = False,
-        **kwargs,
+            self,
+            atoms: Structure | Atoms,
+            *,
+            n_points: int = 11,
+            fmax: float | None = 0.3,
+            steps: int | None = 500,
+            verbose: bool | None = False,
+            **kwargs,
     ) -> None:
         """Relax the Structure/Atoms and fit the Birch-Murnaghan equation of state.
 
@@ -836,7 +1168,7 @@ class EquationOfState:
             atoms (Structure | Atoms): A Structure or Atoms object to relax.
             n_points (int): Number of structures used in fitting the equation of states
             fmax (float | None): The maximum force tolerance for relaxation.
-                Default = 0.1
+                Default = 0.3
             steps (int | None): The maximum number of steps for relaxation.
                 Default = 500
             verbose (bool): Whether to print the output of the ASE optimizer.
@@ -856,7 +1188,7 @@ class EquationOfState:
         )
 
         volumes, energies = [], []
-        for idx in np.linspace(-0.1, 0.1, n_points):
+        for idx in np.linspace(-0.25, 0.25, n_points):
             structure_strained = local_minima["final_structure"].copy()
             structure_strained.apply_strain([idx, idx, idx])
             result = self.relaxer.relax(
