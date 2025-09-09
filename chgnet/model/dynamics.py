@@ -127,8 +127,8 @@ def simple_pso(
     # 设置速度限制（基于搜索空间的大小）
     v_bounds = []
     for i in range(dim):
-        v_min = -(bounds[i][1] - bounds[i][0]) * 0.25  # 速度限制为搜索范围的10%
-        v_max = (bounds[i][1] - bounds[i][0]) * 0.25
+        v_min = -(bounds[i][1] - bounds[i][0]) * 0.1  # 速度限制为搜索范围的10%
+        v_max = (bounds[i][1] - bounds[i][0]) * 0.1
         v_bounds.append((v_min, v_max))
 
     # 初始化粒子位置和速度
@@ -583,7 +583,7 @@ class StructOptimizer:
 
             # 计算笛卡尔坐标系下的最大位移(Å)
             # 半径从pm转换为Å(除以100)，然后乘以10%
-            max_displacement_A = radius_pm / 100.0 * 0.25
+            max_displacement_A = radius_pm / 100.0 * 0.3
 
             # 将笛卡尔坐标下的最大位移转换为分数坐标
             lattice_inv = atoms.lattice.inv_matrix
@@ -1188,7 +1188,7 @@ class EquationOfState:
         )
 
         volumes, energies = [], []
-        for idx in np.linspace(-0.25, 0.25, n_points):
+        for idx in np.linspace(-0.3, 0.3, n_points):
             structure_strained = local_minima["final_structure"].copy()
             structure_strained.apply_strain([idx, idx, idx])
             result = self.relaxer.relax(
