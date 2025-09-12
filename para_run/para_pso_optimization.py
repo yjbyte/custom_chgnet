@@ -308,10 +308,10 @@ def main():
     parser = argparse.ArgumentParser(description='使用PSO方法并行优化晶体结构')
     # parser.add_argument('--input', '-i', type=str, default='./cif/mpts_52',help='输入CIF文件或包含CIF文件的目录路径')
     # parser.add_argument('--output', '-o', type=str, default='./cif/optimizer_mpts_52',help='输出目录，用于保存优化后的结构')
-    parser.add_argument('--input', '-i', type=str, default='./sort_cif/D2',help='输入CIF文件或包含CIF文件的目录路径')
-    parser.add_argument('--output', '-o', type=str, default='./sort_cif/D2_optimizer_30.0.25',help='输出目录，用于保存优化后的结构')
+    parser.add_argument('--input', '-i', type=str, default='../test_data', help='输入CIF文件或包含CIF文件的目录路径')
+    parser.add_argument('--output', '-o', type=str, default='../test_data/pso_optimizer',help='输出目录，用于保存优化后的结构')
     # 新增日志文件参数
-    parser.add_argument('--log', type=str, default='./D2_log_30_0.25', help='日志文件路径，不指定则只输出到控制台')
+    parser.add_argument('--log', type=str, default='../test_data/pso_optimizer',help='日志文件路径，不指定则只输出到控制台')
     # PSO相关参数
     parser.add_argument('--particles', '-p', type=int, default=10, help='PSO算法的粒子数量 (默认: 10)')
     parser.add_argument('--iterations', '-n', type=int, default=30, help='PSO算法的最大迭代次数 (默认: 100)')
