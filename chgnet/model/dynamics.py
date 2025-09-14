@@ -96,6 +96,234 @@ def load_atomic_radii(csv_path: Optional[str] = None) -> Dict[str, float]:
 
     return atomic_radii
 
+def hybrid_pso_fire(
+        objective_func: Callable[[np.ndarray], float],
+        bounds: List[Tuple[float, float]],
+        n_particles: int = 20,
+        max_iter: int = 100,
+        pso_ratio: float = 0.7,
+        c1: float = 0.5,
+        c2: float = 0.5,
+        w: float = 0.9,
+        dt: float = 0.1,
+        dtmax: float = 1.0,
+        Nmin: int = 5,
+        finc: float = 1.1,
+        fdec: float = 0.5,
+        astart: float = 0.1,
+        fa: float = 0.99,
+        dynamic_ratio: bool = True
+) -> Tuple[np.ndarray, float]:
+    """
+    混合PSO-FIRE优化算法实现。
+    同时使用PSO粒子和FIRE粒子，结合全局搜索和局部精确优化的优势。
+    
+    Args:
+        objective_func: 目标函数，接收粒子位置(numpy数组)并返回一个标量值
+        bounds: 每个维度的搜索范围，格式为[(min_1, max_1), (min_2, max_2), ...]
+        n_particles: 粒子总数
+        max_iter: 最大迭代次数
+        pso_ratio: PSO粒子所占比例，默认为0.7
+        c1: PSO认知参数，默认为0.5
+        c2: PSO社会参数，默认为0.5
+        w: PSO惯性权重，默认为0.9
+        dt: FIRE初始时间步长，默认为0.1
+        dtmax: FIRE最大时间步长，默认为1.0
+        Nmin: FIRE连续下降步数阈值，默认为5
+        finc: FIRE时间步长增加因子，默认为1.1
+        fdec: FIRE时间步长减少因子，默认为0.5
+        astart: FIRE初始混合系数，默认为0.1
+        fa: FIRE混合系数衰减因子，默认为0.99
+        dynamic_ratio: 是否动态调整PSO和FIRE粒子比例，默认为True
+
+    Returns:
+        Tuple[np.ndarray, float]: 最优位置和对应的目标函数值
+    """
+    # 获取问题维度
+    dim = len(bounds)
+    
+    # 计算PSO和FIRE粒子数量
+    n_pso = int(n_particles * pso_ratio)
+    n_fire = n_particles - n_pso
+    
+    # 设置速度限制（基于搜索空间的大小）
+    v_bounds = []
+    for i in range(dim):
+        v_min = -(bounds[i][1] - bounds[i][0]) * 0.25
+        v_max = (bounds[i][1] - bounds[i][0]) * 0.25
+        v_bounds.append((v_min, v_max))
+    
+    # 初始化所有粒子的位置和速度
+    positions = np.zeros((n_particles, dim))
+    velocities = np.zeros((n_particles, dim))
+    
+    # 随机初始化所有粒子的位置和速度
+    for i in range(dim):
+        positions[:, i] = np.random.uniform(
+            bounds[i][0], bounds[i][1], size=n_particles
+        )
+        velocities[:, i] = np.random.uniform(
+            v_bounds[i][0], v_bounds[i][1], size=n_particles
+        )
+    
+    # 为每个粒子分配类型: 0=PSO, 1=FIRE
+    particle_types = np.zeros(n_particles)
+    particle_types[n_pso:] = 1  # 后n_fire个粒子为FIRE类型
+    
+    # 初始化FIRE特有的参数
+    dt_values = np.ones(n_particles) * dt  # 每个FIRE粒子的时间步长
+    a_values = np.ones(n_particles) * astart  # 每个FIRE粒子的混合系数
+    Nsteps_values = np.zeros(n_particles)  # 每个FIRE粒子的连续下降步数
+    
+    # 初始化每个粒子的最佳位置和值
+    pbest_pos = positions.copy()
+    pbest_val = np.array([objective_func(pos) for pos in positions])
+    
+    # 初始化全局最佳位置和值
+    gbest_idx = np.argmin(pbest_val)
+    gbest_pos = pbest_pos[gbest_idx].copy()
+    gbest_val = pbest_val[gbest_idx]
+    
+    # 初始化上一次的函数值（用于FIRE判断上坡/下坡）
+    prev_vals = pbest_val.copy()
+    
+    # 主循环
+    for iter_idx in range(max_iter):
+        # 动态调整粒子比例（如果启用）
+        if dynamic_ratio and iter_idx > max_iter // 3:
+            # 计算优化进度，优化后期增加FIRE粒子比例
+            progress = min(1.0, iter_idx / max_iter)
+            target_fire_ratio = 0.3 + 0.4 * progress  # 从30%逐渐增加到70%
+            target_n_fire = int(n_particles * target_fire_ratio)
+            
+            # 仅当目标比例变化较大时才重新分配
+            if abs(target_n_fire - np.sum(particle_types)) > n_particles * 0.1:
+                # 确定哪些粒子需要转换类型
+                pso_indices = np.where(particle_types == 0)[0]
+                fire_indices = np.where(particle_types == 1)[0]
+                
+                if len(pso_indices) > n_particles - target_n_fire:
+                    # 需要将一些PSO粒子转换为FIRE粒子
+                    n_convert = len(pso_indices) - (n_particles - target_n_fire)
+                    # 选择性能较差的PSO粒子转换为FIRE
+                    pso_performance = [(i, pbest_val[i]) for i in pso_indices]
+                    pso_performance.sort(key=lambda x: x[1], reverse=True)  # 降序排列
+                    for i in range(n_convert):
+                        idx = pso_performance[i][0]
+                        particle_types[idx] = 1
+                        # 初始化FIRE参数
+                        dt_values[idx] = dt
+                        a_values[idx] = astart
+                        Nsteps_values[idx] = 0
+                
+                elif len(fire_indices) > target_n_fire:
+                    # 需要将一些FIRE粒子转换为PSO粒子
+                    n_convert = len(fire_indices) - target_n_fire
+                    # 选择性能较差的FIRE粒子转换为PSO
+                    fire_performance = [(i, pbest_val[i]) for i in fire_indices]
+                    fire_performance.sort(key=lambda x: x[1], reverse=True)  # 降序排列
+                    for i in range(n_convert):
+                        idx = fire_performance[i][0]
+                        particle_types[idx] = 0
+        
+        # 更新每个粒子
+        for i in range(n_particles):
+            # 根据粒子类型选择更新规则
+            if particle_types[i] == 0:  # PSO粒子
+                # 生成随机系数
+                r1 = np.random.random(dim)
+                r2 = np.random.random(dim)
+                
+                # 更新速度
+                cognitive_velocity = c1 * r1 * (pbest_pos[i] - positions[i])
+                social_velocity = c2 * r2 * (gbest_pos - positions[i])
+                velocities[i] = w * velocities[i] + cognitive_velocity + social_velocity
+                
+                # 应用速度限制
+                for j in range(dim):
+                    velocities[i, j] = np.clip(velocities[i, j], v_bounds[j][0], v_bounds[j][1])
+                
+                # 更新位置
+                positions[i] += velocities[i]
+                
+            else:  # FIRE粒子
+                # 计算新位置的目标函数值
+                current_val = objective_func(positions[i])
+                
+                # 计算梯度（数值梯度）
+                grad = np.zeros(dim)
+                h = 1e-6  # 扰动步长
+                for j in range(dim):
+                    pos_h = positions[i].copy()
+                    pos_h[j] += h
+                    val_h = objective_func(pos_h)
+                    grad[j] = (val_h - current_val) / h
+                
+                # 将梯度转换为力（力 = -梯度）
+                forces = -grad
+                
+                # 计算速度和力的点积
+                vf = np.vdot(velocities[i], forces)
+                
+                # 判断是否下坡移动
+                is_downhill = current_val <= prev_vals[i]
+                
+                if vf > 0.0 and is_downhill:
+                    # 速度和力方向一致，处于下降通道
+                    # 混合速度和力
+                    v_norm = np.sqrt(np.vdot(velocities[i], velocities[i]))
+                    if v_norm > 1e-10:  # 避免除以零
+                        f_norm = np.sqrt(np.vdot(forces, forces))
+                        velocities[i] = (1.0 - a_values[i]) * velocities[i] + \
+                                       a_values[i] * forces / f_norm * v_norm
+                    
+                    # 更新参数
+                    if Nsteps_values[i] > Nmin:
+                        dt_values[i] = min(dt_values[i] * finc, dtmax)
+                        a_values[i] *= fa
+                    Nsteps_values[i] += 1
+                else:
+                    # 重置速度和参数
+                    velocities[i][:] = 0.0
+                    a_values[i] = astart
+                    dt_values[i] *= fdec
+                    Nsteps_values[i] = 0
+                
+                # 更新位置
+                velocities[i] += dt_values[i] * forces
+                dr = dt_values[i] * velocities[i]
+                
+                # 限制最大步长
+                dr_norm = np.sqrt(np.vdot(dr, dr))
+                max_step = 0.1 * min([bounds[j][1] - bounds[j][0] for j in range(dim)])
+                if dr_norm > max_step:
+                    dr = max_step * dr / dr_norm
+                
+                # 更新位置
+                positions[i] += dr
+            
+            # 记录当前函数值，用于下一轮比较
+            prev_vals[i] = objective_func(positions[i])
+            
+            # 对所有粒子应用位置边界限制
+            for j in range(dim):
+                positions[i, j] = np.clip(positions[i, j], bounds[j][0], bounds[j][1])
+            
+            # 评估新位置
+            val = objective_func(positions[i])
+            
+            # 更新粒子最佳位置
+            if val < pbest_val[i]:
+                pbest_pos[i] = positions[i].copy()
+                pbest_val[i] = val
+                
+                # 更新全局最佳位置
+                if val < gbest_val:
+                    gbest_pos = positions[i].copy()
+                    gbest_val = val
+    
+    # 返回全局最优位置和对应的值
+    return gbest_pos, gbest_val
 
 def simple_pso(
         objective_func: Callable[[np.ndarray], float],
@@ -540,6 +768,170 @@ class StructOptimizer:
                 "magmom", [float(magmom) for magmom in atoms.get_magnetic_moments()]
             )
         return {"final_structure": struct, "trajectory": obs}
+
+        def relax_hybrid_pso_fire(self, atoms: Structure, n_particles: int = 20, max_iter: int = 50,
+                                  pso_ratio: float = 0.7, c1: float = 0.5, c2: float = 0.5, w: float = 0.9,
+                                  dt: float = 0.1, dtmax: float = 1.0, Nmin: int = 5, finc: float = 1.1,
+                                  fdec: float = 0.5, astart: float = 0.1, fa: float = 0.99,
+                                  use_entropy: bool = False, temperature: float = 0.1,
+                                  entropy_bin_width: float = 0.2, entropy_cutoff: float = 10.0,
+                                  dynamic_ratio: bool = True) -> Structure:
+            """
+            使用混合PSO-FIRE优化算法对晶体结构进行优化。
+            结合了PSO的全局搜索能力和FIRE的局部精确优化能力。
+
+            Args:
+                atoms (Structure): 要优化的Pymatgen Structure对象
+                n_particles (int): 粒子总数，默认为20
+                max_iter (int): 最大迭代次数，默认为50
+                pso_ratio (float): PSO粒子所占比例，默认为0.7
+                c1 (float): PSO的认知参数，默认为0.5
+                c2 (float): PSO的社会参数，默认为0.5
+                w (float): PSO的惯性权重，默认为0.9
+                dt (float): FIRE初始时间步长，默认为0.1
+                dtmax (float): FIRE最大时间步长，默认为1.0
+                Nmin (int): FIRE连续下降步数阈值，默认为5
+                finc (float): FIRE时间步长增加因子，默认为1.1
+                fdec (float): FIRE时间步长减少因子，默认为0.5
+                astart (float): FIRE初始混合系数，默认为0.1
+                fa (float): FIRE混合系数衰减因子，默认为0.99
+                use_entropy (bool): 是否在优化目标中包含构型熵，默认为False
+                temperature (float): 熵的贡献权重因子T，默认为0.1
+                entropy_bin_width (float): 熵计算中距离分箱的宽度，默认为0.2
+                entropy_cutoff (float): 熵计算中原子间距的最大截断距离，默认为10.0
+                dynamic_ratio (bool): 是否动态调整PSO和FIRE粒子比例，默认为True
+
+            Returns:
+                Structure: 优化后的晶体结构
+            """
+            # 1. 获取原子符号和离子半径映射
+            atomic_radii = load_atomic_radii()
+            default_radius = 120.0  # 默认半径值(pm)
+
+            # 2. 获取结构信息
+            n_atoms = len(atoms)
+            species = [site.specie.symbol for site in atoms]
+
+            # 获取初始分数坐标
+            initial_frac_coords = np.array([site.frac_coords for site in atoms])
+
+            # 3. 计算每个原子的最大位移边界
+            bounds = []
+
+            for i, atom_symbol in enumerate(species):
+                # 查找原子半径，如果不存在则使用默认值
+                radius_pm = atomic_radii.get(atom_symbol, default_radius)
+
+                # 计算笛卡尔坐标系下的最大位移(Å)
+                # 半径从pm转换为Å(除以100)，然后乘以25%
+                max_displacement_A = radius_pm / 100.0 * 0.25
+
+                # 将笛卡尔坐标下的最大位移转换为分数坐标
+                lattice_inv = atoms.lattice.inv_matrix
+
+                # 计算三个轴方向上的最大分数坐标位移
+                cart_displacements = [
+                    [max_displacement_A, 0, 0],  # x方向
+                    [0, max_displacement_A, 0],  # y方向
+                    [0, 0, max_displacement_A]  # z方向
+                ]
+
+                # 计算这些笛卡尔位移在分数坐标下的大小
+                frac_displacements = []
+                for cart_disp in cart_displacements:
+                    frac_disp = np.dot(lattice_inv, cart_disp)
+                    frac_displacements.append(np.linalg.norm(frac_disp))
+
+                # 设置x, y, z三个方向的边界
+                for j in range(3):
+                    # 分数坐标下的边界
+                    bounds.append((-frac_displacements[j], frac_displacements[j]))
+
+            # 4. 定义目标函数
+            def objective_function(particle_position: np.ndarray) -> float:
+                """
+                混合优化的目标函数，计算给定原子位移下结构的能量。
+                如果use_entropy为True，则返回 E_CHGNet - T * S_dist。
+
+                Args:
+                    particle_position (np.ndarray): 所有原子的位移向量，格式为[dx1, dy1, dz1, dx2, dy2, dz2, ...]
+
+                Returns:
+                    float: 结构的能量值（可能包含熵贡献）。
+                """
+                # 重塑位移向量为(n_atoms, 3)形状
+                displacements = particle_position.reshape((-1, 3))
+
+                # 计算新的分数坐标
+                new_frac_coords = initial_frac_coords + displacements
+
+                # 创建一个新的结构对象
+                new_structure = atoms.copy()
+
+                # 更新所有原子的位置
+                for i in range(n_atoms):
+                    new_structure.replace(i, species[i], new_frac_coords[i], properties=atoms[i].properties)
+
+                # 使用CHGNet计算能量
+                prediction = self.calculator.model.predict_structure(new_structure, task='e')
+                energy_chgnet = float(prediction['e'])
+
+                if use_entropy:
+                    s_dist = calculate_distance_entropy(
+                        new_structure,
+                        bin_width=entropy_bin_width,
+                        cutoff=entropy_cutoff
+                    )
+                    return energy_chgnet - temperature * s_dist
+                else:
+                    return energy_chgnet
+
+            # 5. 调用混合PSO-FIRE优化器
+            print(f"开始混合PSO-FIRE优化，使用 {n_particles} 个粒子和 {max_iter} 次迭代...")
+            print(f"初始PSO/FIRE粒子比例: {pso_ratio * 100:.1f}% / {(1 - pso_ratio) * 100:.1f}%")
+            if dynamic_ratio:
+                print("动态粒子比例调整已启用")
+
+            if use_entropy:
+                print(f"熵优化已启用: T = {temperature}, bin_width = {entropy_bin_width}, cutoff = {entropy_cutoff}")
+
+            gbest_position, gbest_energy = hybrid_pso_fire(
+                objective_func=objective_function,
+                bounds=bounds,
+                n_particles=n_particles,
+                max_iter=max_iter,
+                pso_ratio=pso_ratio,
+                c1=c1,
+                c2=c2,
+                w=w,
+                dt=dt,
+                dtmax=dtmax,
+                Nmin=Nmin,
+                finc=finc,
+                fdec=fdec,
+                astart=astart,
+                fa=fa,
+                dynamic_ratio=dynamic_ratio
+            )
+
+            print(f"混合PSO-FIRE优化完成，最佳目标函数值: {gbest_energy}")
+
+            # 6. 处理优化结果
+            # 重塑最佳位置为(n_atoms, 3)形状
+            best_displacements = gbest_position.reshape((-1, 3))
+
+            # 计算最终的原子分数坐标
+            final_frac_coords = initial_frac_coords + best_displacements
+
+            # 创建最终结构
+            final_structure = atoms.copy()
+
+            # 更新所有原子的位置
+            for i in range(n_atoms):
+                final_structure.replace(i, species[i], final_frac_coords[i], properties=atoms[i].properties)
+
+            # 7. 返回优化后的结构
+            return final_structure
 
     def relax_pso(self, atoms: Structure, n_particles: int = 10, max_iter: int = 50, c1: float = 0.5, c2: float = 0.5,
                   w: float = 0.9, use_entropy: bool = False, temperature: float = 0.1,
